@@ -1,7 +1,6 @@
 import time, os
-from scipy.ndimage.filters import maximum_filter1d
+from scipy.ndimage import maximum_filter1d, find_objects
 import torch
-import scipy.ndimage
 import numpy as np
 import tifffile
 from tqdm import trange
@@ -18,16 +17,20 @@ import torch
 from torch import optim, nn
 from . import resnet_torch
 TORCH_ENABLED = True 
+torch_GPU = torch.device('mps')
+torch_CPU = torch.device('mps')
 
-torch_GPU = torch.device('cuda') if torch.cuda.is_available() else torch.device('mps') if torch.backends.mps.is_available() else None
-torch_CPU = torch.device('cpu')
 
-@njit('(float32[:], int32[:], int32[:], int32, int32, int32, int32)', nogil=True)
+
+
+
+
+@njit('(float64[:], int32[:], int32[:], int32, int32, int32, int32)', nogil=True)
 def _extend_centers(T,y,x,ymed,xmed,Lx, niter):
     """ run diffusion from center of mask (ymed, xmed) on mask pixels (y, x)
     Parameters
     --------------
-    T: float32, array
+    T: float64, array
         _ x Lx array that diffusion is run in
     y: int32, array
         pixels in y inside mask
@@ -43,7 +46,7 @@ def _extend_centers(T,y,x,ymed,xmed,Lx, niter):
         number of iterations to run diffusion
     Returns
     ---------------
-    T: float32, array
+    T: float64, array
         amount of diffused particles at each pixel
     """
 
@@ -57,7 +60,7 @@ def _extend_centers(T,y,x,ymed,xmed,Lx, niter):
 
 
 
-def _extend_centers_gpu(neighbors, centers, isneighbor, Ly, Lx, n_iter=200, device=torch_GPU):
+def _extend_centers_gpu(neighbors, centers, isneighbor, Ly, Lx, n_iter=200, device=torch.device('cuda')):
     """ runs diffusion on GPU to generate flows for training images or quality control
     
     neighbors is 9 x pixels in masks, 
@@ -70,7 +73,7 @@ def _extend_centers_gpu(neighbors, centers, isneighbor, Ly, Lx, n_iter=200, devi
     nimg = neighbors.shape[0] // 9
     pt = torch.from_numpy(neighbors).to(device)
     
-    T = torch.zeros((nimg,Ly,Lx), dtype=torch.float, device=device)
+    T = torch.zeros((nimg,Ly,Lx), dtype=torch.float32, device=device)
     meds = torch.from_numpy(centers.astype(int)).to(device).long()
     isneigh = torch.from_numpy(isneighbor).to(device)
     for i in range(n_iter):
@@ -86,7 +89,7 @@ def _extend_centers_gpu(neighbors, centers, isneighbor, Ly, Lx, n_iter=200, devi
     dy = grads[:,0] - grads[:,1]
     dx = grads[:,2] - grads[:,3]
     del grads
-    mu_torch = np.stack((dy.cpu().squeeze(), dx.cpu().squeeze()), axis=-2)
+    mu_torch = np.stack((dy.cpu().squeeze(0), dx.cpu().squeeze(0)), axis=-2)
     return mu_torch
 
 
@@ -107,7 +110,7 @@ def masks_to_flows_gpu(masks, device=None):
         in which it resides 
     """
     if device is None:
-        device = torch_GPU
+        device = torch.device('gpu')
 
     
     Ly0,Lx0 = masks.shape
@@ -127,7 +130,7 @@ def masks_to_flows_gpu(masks, device=None):
     neighbors = np.stack((neighborsY, neighborsX), axis=-1)
 
     # get mask centers
-    slices = scipy.ndimage.find_objects(masks)
+    slices = find_objects(masks)
     
     centers = np.zeros((masks.max(), 2), 'int')
     for i,si in enumerate(slices):
@@ -186,11 +189,11 @@ def masks_to_flows_cpu(masks, device=None):
     """
     
     Ly, Lx = masks.shape
-    mu = np.zeros((2, Ly, Lx), np.float32)
-    mu_c = np.zeros((Ly, Lx), np.float32)
+    mu = np.zeros((2, Ly, Lx), np.float64)
+    mu_c = np.zeros((Ly, Lx), np.float64)
     
     nmask = masks.max()
-    slices = scipy.ndimage.find_objects(masks)
+    slices = find_objects(masks)
     dia = utils.diameters(masks)[0]
     s2 = (.15 * dia)**2
     for i,si in enumerate(slices):
@@ -210,7 +213,7 @@ def masks_to_flows_cpu(masks, device=None):
             mu_c[sr.start+y-1, sc.start+x-1] = np.exp(-d2/s2)
 
             niter = 2*np.int32(np.ptp(x) + np.ptp(y))
-            T = np.zeros((ly+2)*(lx+2), np.float32)
+            T = np.zeros((ly+2)*(lx+2), np.float64)
             T = _extend_centers(T, y, x, ymed, xmed, np.int32(lx), np.int32(niter))
             T[(y+1)*lx + x+1] = np.log(1.+T[(y+1)*lx + x+1])
 
@@ -321,7 +324,7 @@ def labels_to_flows(labels, files=None, use_gpu=False, device=None, redo_flows=F
         if files is not None:
             for flow, file in zip(flows, files):
                 file_name = os.path.splitext(file)[0]
-                tifffile.imsave(file_name+'_flows.tif', flow)
+                tifffile.imwrite(file_name+'_flows.tif', flow)
     else:
         dynamics_logger.info('flows precomputed')
         flows = [labels[n].astype(np.float32) for n in range(nimg)]
@@ -393,7 +396,7 @@ def steps2D_interp(p, dP, niter, use_gpu=False, device=None):
         for k in range(2): 
             pt[:,:,:,k] *= shape[k]        
         
-        p =  pt.cpu()[:,:,:,[1,0]].numpy().squeeze().T
+        p =  pt[:,:,:,[1,0]].cpu().numpy().squeeze().T
         return p
 
     else:
@@ -579,6 +582,27 @@ def remove_bad_flow_masks(masks, flows, threshold=0.4, use_gpu=False, device=Non
         size [Ly x Lx] or [Lz x Ly x Lx]
     
     """
+    if masks.size > 10000*10000:
+        
+        major_version, minor_version, _ = torch.__version__.split(".")
+        
+        if major_version == "1" and int(minor_version) < 10:
+            # for PyTorch version lower than 1.10
+            def mem_info():
+                total_mem = torch.cuda.get_device_properties(0).total_memory
+                used_mem = torch.cuda.memory_allocated()
+                return total_mem, used_mem
+        else:
+            # for PyTorch version 1.10 and above
+            def mem_info():
+                total_mem, used_mem = torch.cuda.mem_get_info()
+                return total_mem, used_mem
+        
+        if masks.size * 20 > mem_info()[0]:
+            dynamics_logger.warning('WARNING: image is very large, not using gpu to compute flows from masks for QC step flow_threshold')
+            dynamics_logger.info('turn off QC step with flow_threshold=0 if too slow')
+        use_gpu = False
+
     merrors, _ = metrics.flow_error(masks, flows, use_gpu, device)
     badi = 1+(merrors>threshold).nonzero()[0]
     masks[np.isin(masks, badi)] = 0

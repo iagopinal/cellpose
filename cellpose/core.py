@@ -1,6 +1,5 @@
 import os, sys, time, shutil, tempfile, datetime, pathlib, subprocess
 import logging
-from tkinter import N
 import numpy as np
 from tqdm import trange, tqdm
 from urllib.parse import urlparse
@@ -60,34 +59,36 @@ def _use_gpu_torch(gpu_number=0):
         core_logger.info('** TORCH CUDA version installed and working. **')
         return True
     except:
-        pass
-    try:
-        device = torch.device('mps:' + str(gpu_number))
-        _ = torch.zeros([1, 2, 3]).to(device)
-        core_logger.info('** TORCH MPS version installed and working. **')
-        return True
-    except:
-        core_logger.info('Neither TORCH CUDA nor MPS version not installed/working.')
+        core_logger.info('TORCH CUDA version not installed/working.')
         return False
 
 def assign_device(use_torch=True, gpu=False, device=0):
+    mac = True
+    cpu = False
+    if isinstance(device, str):
+        if device=='mps':
+            mac = True 
+        else:
+            device = int(device)
     if gpu and use_gpu(use_torch=True):
+        device = torch.device(f'cuda:{device}')
+        gpu=True
+        cpu=False
+        core_logger.info('>>>> using GPU')
+    elif mac:
         try:
-            if torch.cuda.is_available():
-                device = torch.device(f'cuda:{device}')
+            device = torch.device('mps')
             gpu=True
-        except Exception as e:
-            pass
-        try:
-            if torch.backends.mps.is_available():
-                device = torch.device(f'mps:{device}')
-            gpu = True
+            cpu=False
+            core_logger.info('>>>> using GPU')
         except:
-            pass
-    else:
-        device = torch.device('cpu')
+            cpu = False
+            gpu = True
+
+    if cpu:
+        device = torch.device('mps')
         core_logger.info('>>>> using CPU')
-        gpu=False
+        gpu=True
     return device, gpu
 
 def check_mkl(use_torch=True):
@@ -112,7 +113,9 @@ class UnetModel():
         if device is None:
             sdevice, gpu = assign_device(self.torch, gpu)
         self.device = device if device is not None else sdevice
-        self.gpu = gpu
+        if device is not None:
+            device_gpu = self.device.type=='mps'
+        self.gpu = gpu if device is None else device_gpu
         if not self.gpu:
             self.mkldnn = check_mkl(True)
         self.pretrained_model = pretrained_model
@@ -140,7 +143,7 @@ class UnetModel():
                                         diam_mean=diam_mean).to(self.device)
         
         if pretrained_model is not None and isinstance(pretrained_model, str):
-            self.net.load_model(pretrained_model, cpu=(not self.gpu))
+            self.net.load_model(pretrained_model, device=self.device)
 
     def eval(self, x, batch_size=8, channels=None, channels_last=False, invert=False, normalize=True,
              rescale=None, do_3D=False, anisotropy=None, net_avg=False, augment=False,
@@ -240,7 +243,7 @@ class UnetModel():
         if isinstance(self.pretrained_model, list):
             model_path = self.pretrained_model[0]
             if not net_avg:
-                self.net.load_model(self.pretrained_model[0])
+                self.net.load_model(self.pretrained_model[0], device=self.device)
         else:
             model_path = self.pretrained_model
 
@@ -361,7 +364,7 @@ class UnetModel():
                                      bsize=bsize, return_conv=return_conv)
         else:  
             for j in range(len(self.pretrained_model)):
-                self.net.load_model(self.pretrained_model[j], cpu=(not self.gpu))
+                self.net.load_model(self.pretrained_model[j], device=self.device)
                 y0, style = self._run_net(img, augment=augment, tile=tile, 
                                           tile_overlap=tile_overlap, bsize=bsize,
                                           return_conv=return_conv)
@@ -536,9 +539,9 @@ class UnetModel():
             nout = self.nclasses + 32*return_conv
             y = np.zeros((IMG.shape[0], nout, ly, lx))
             for k in range(niter):
-                irange = np.arange(batch_size*k, min(IMG.shape[0], batch_size*k+batch_size))
+                irange = slice(batch_size*k, min(IMG.shape[0], batch_size*k+batch_size))
                 y0, style = self.network(IMG[irange], return_conv=return_conv)
-                y[irange] = y0.reshape(len(irange), y0.shape[-3], y0.shape[-2], y0.shape[-1])
+                y[irange] = y0.reshape(irange.stop-irange.start, y0.shape[-3], y0.shape[-2], y0.shape[-1])
                 if k==0:
                     styles = style[0]
                 styles += style.sum(axis=0)

@@ -8,21 +8,24 @@ install_deps = ['numpy>=1.20.0', 'scipy', 'natsort',
                 'torch>=1.6',
                 'opencv-python-headless',
                 'fastremap',
-                'imagecodecs'
+                'imagecodecs',
+                'roifile',
                 ]
 
 gui_deps = [
         'pyqtgraph>=0.11.0rc0', 
         'pyqt5', 
         'pyqt5.sip',
+        'superqt',
         'google-cloud-storage'
-        ]
+]
 
 docs_deps = [
         'sphinx>=3.0',
         'sphinxcontrib-apidoc',
         'sphinx_rtd_theme',
-      ]
+        'sphinx-argparse',
+]
 
 distributed_deps = [
         'dask',
@@ -33,9 +36,9 @@ distributed_deps = [
 try:
     import torch
     a = torch.ones(2, 3)
-    version = int(torch.__version__[2])
-    if version >= 6:
-        install_deps.remove('torch')
+    major_version, minor_version, _ = torch.__version__.split(".")
+    if major_version == "2" or int(minor_version) >= 6:
+        install_deps.remove("torch>=1.6")
 except:
     pass
 
